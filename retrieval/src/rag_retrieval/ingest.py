@@ -1,9 +1,11 @@
 import argparse
+import gzip
 import hashlib
+import json
 import logging
 import os
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
 from typing import List, Tuple
 
 import psycopg
@@ -16,18 +18,6 @@ from rag_retrieval.db import create_vector_index, get_conn, init_db
 from rag_retrieval.embedding import get_embedder
 
 logger = logging.getLogger(__name__)
-
-
-def download_text(gutenberg_id: int, urls: List[str], timeout: int = 30) -> Tuple[int, str, str]:
-    for url in urls:
-        try:
-            resp = requests.get(url, timeout=timeout)
-            if resp.status_code == 200 and len(resp.text.strip()) > 500:
-                checksum = hashlib.sha256(resp.text.encode("utf-8")).hexdigest()
-                return gutenberg_id, url, resp.text
-        except requests.RequestException:
-            continue
-    raise RuntimeError(f"Failed to fetch Gutenberg id {gutenberg_id}")
 
 
 def upsert_document(conn: psycopg.Connection, source_id: str, title: str, url: str, checksum: str) -> int:
@@ -68,66 +58,111 @@ def insert_chunks(conn: psycopg.Connection, document_id: int, chunks: List[Tuple
     conn.commit()
 
 
-def ingest_from_ids(settings):
-    logger.info("Downloading Gutenberg IDs: %s", settings.dataset_ids)
+def parse_review_record(record: dict) -> str:
+    parts = []
+    summary = record.get("summary") or ""
+    text = record.get("reviewText") or ""
+    if summary:
+        parts.append(summary.strip())
+    if text:
+        parts.append(text.strip())
+    combined = ". ".join(parts).strip()
+    return combined
+
+
+def download_and_parse_dataset(name: str, url: str, max_reviews: int | None, timeout: int):
+    logger.info("Downloading dataset %s from %s", name, url)
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    reviews = []
+    with gzip.open(BytesIO(resp.content), "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = parse_review_record(record)
+            if not content:
+                continue
+            asin = record.get("asin", "unknown")
+            reviewer = record.get("reviewerID", "unknown")
+            source_id = f"{name}:{asin}:{reviewer}:{len(reviews)}"
+            title = f"{name} review {asin}"
+            reviews.append({"source_id": source_id, "url": url, "text": content, "title": title})
+            if max_reviews and len(reviews) >= max_reviews:
+                break
+    logger.info("Parsed %d reviews from %s", len(reviews), name)
+    return reviews
+
+
+def load_local_dataset(path: str, name: str, max_reviews: int | None):
+    reviews = []
+    logger.info("Loading local dataset %s from %s", name, path)
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            content = parse_review_record(record)
+            if not content:
+                continue
+            asin = record.get("asin", "unknown")
+            reviewer = record.get("reviewerID", "unknown")
+            source_id = f"{name}:{asin}:{reviewer}:{len(reviews)}"
+            title = f"{name} review {asin}"
+            reviews.append({"source_id": source_id, "url": f"file://{os.path.abspath(path)}", "text": content, "title": title})
+            if max_reviews and len(reviews) >= max_reviews:
+                break
+    logger.info("Parsed %d reviews from local %s", len(reviews), name)
+    return reviews
+
+
+def ingest_from_remote(settings):
     jobs = []
     with ThreadPoolExecutor(max_workers=settings.max_workers) as executor:
-        for gid in settings.dataset_ids:
-            urls = [u for u in settings.dataset_urls if f"/{gid}/" in u or f"pg{gid}.txt" in u]
-            jobs.append(executor.submit(download_text, gid, urls, settings.request_timeout))
-
+        for name, url in zip(settings.dataset_names, settings.dataset_urls):
+            jobs.append(
+                executor.submit(
+                    download_and_parse_dataset,
+                    name,
+                    url,
+                    settings.max_reviews_per_dataset,
+                    settings.request_timeout,
+                )
+            )
         results = []
         for future in tqdm(as_completed(jobs), total=len(jobs), desc="Downloading"):
-            results.append(future.result())
-
-    docs = []
-    for gid, url, text in results:
-        docs.append({"source_id": gid, "url": url, "text": text, "title": f"Gutenberg #{gid}"})
-    return docs
+            results.extend(future.result())
+    return results
 
 
-def iter_mirror_files(base_path: str, limit: int | None = None):
-    count = 0
-    for root, _, files in os.walk(base_path):
-        for fname in files:
-            if not fname.lower().endswith(".txt"):
-                continue
-            yield os.path.join(root, fname)
-            count += 1
-            if limit and count >= limit:
-                return
-
-
-def load_local_file(path: str):
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-    basename = os.path.basename(path)
-    match = re.search(r"(\d+)", basename)
-    source_id = match.group(1) if match else basename
-    title = f"Gutenberg local #{source_id}"
-    url = f"file://{os.path.abspath(path)}"
-    return {"source_id": source_id, "url": url, "text": text, "title": title}
-
-
-def ingest_from_mirror(settings):
-    if not settings.mirror_path or not os.path.isdir(settings.mirror_path):
-        raise RuntimeError("Mirror mode enabled but GUTENBERG_MIRROR_PATH is not set or not a directory")
-
-    files = list(iter_mirror_files(settings.mirror_path, settings.ingest_limit))
-    logger.info("Found %d local text files for ingestion", len(files))
-
-    docs = []
+def ingest_from_local(settings):
+    if not settings.local_data_path or not os.path.isdir(settings.local_data_path):
+        raise RuntimeError("LOCAL_DATA_PATH is not set or not a directory for local ingest")
+    files = []
+    for root, _, fnames in os.walk(settings.local_data_path):
+        for fname in fnames:
+            if fname.endswith(".json") or fname.endswith(".jsonl") or fname.endswith(".json.gz"):
+                files.append(os.path.join(root, fname))
+    if not files:
+        raise RuntimeError("No .json/.jsonl/.json.gz files found under LOCAL_DATA_PATH")
+    reviews = []
     with ThreadPoolExecutor(max_workers=settings.max_workers) as executor:
-        futures = [executor.submit(load_local_file, path) for path in files]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading"):
-            docs.append(future.result())
-    return docs
+        futures = []
+        for path in files:
+            name = os.path.splitext(os.path.basename(path))[0]
+            futures.append(executor.submit(load_local_dataset, path, name, settings.max_reviews_per_dataset))
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading local"):
+            reviews.extend(future.result())
+    return reviews
 
 
 def ingest():
     settings = get_settings()
     logging.basicConfig(level=settings.log_level, format="%(asctime)s %(levelname)s %(message)s")
-    mode = "mirror" if settings.is_mirror_mode else "ids"
+    mode = "local" if settings.local_data_path else "remote"
     logger.info("Starting ingestion (mode=%s)", mode)
 
     init_db()
@@ -135,10 +170,10 @@ def ingest():
     if embedder.dim != settings.embedding_dim:
         logger.warning("Embedding dim mismatch: config=%s, model=%s", settings.embedding_dim, embedder.dim)
 
-    if settings.is_mirror_mode:
-        results = ingest_from_mirror(settings)
+    if settings.local_data_path:
+        results = ingest_from_local(settings)
     else:
-        results = ingest_from_ids(settings)
+        results = ingest_from_remote(settings)
 
     with get_conn() as conn:
         for item in tqdm(results, desc="Processing"):

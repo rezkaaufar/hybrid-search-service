@@ -11,10 +11,12 @@ class Settings(BaseModel):
     embedding_dim: int = Field(384, alias="EMBEDDING_DIM")
     chunk_size: int = Field(450, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(80, alias="CHUNK_OVERLAP")
-    dataset_ids: List[int] = Field(default_factory=lambda: [1342, 1661, 98], alias="DATASET_IDS")
-    ingest_mode: str = Field("ids", alias="INGEST_MODE")  # ids | mirror
-    mirror_path: Optional[str] = Field(None, alias="GUTENBERG_MIRROR_PATH")
-    ingest_limit: Optional[int] = Field(None, alias="INGEST_LIMIT")
+    dataset_names: List[str] = Field(default_factory=lambda: ["Baby", "Pet_Supplies", "Video_Games"], alias="DATASET_NAMES")
+    dataset_base_url: str = Field(
+        "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles", alias="DATASET_BASE_URL"
+    )
+    local_data_path: Optional[str] = Field(None, alias="LOCAL_DATA_PATH")
+    max_reviews_per_dataset: Optional[int] = Field(5000, alias="MAX_REVIEWS_PER_DATASET")
     max_workers: int = Field(4, alias="MAX_WORKERS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     request_timeout: int = Field(30, alias="REQUEST_TIMEOUT")
@@ -29,14 +31,14 @@ class Settings(BaseModel):
         settings = cls.model_validate(raw)
         return settings
 
-    @field_validator("dataset_ids", mode="before")
+    @field_validator("dataset_names", mode="before")
     @classmethod
-    def split_dataset_ids(cls, v):
+    def split_dataset_names(cls, v):
         if isinstance(v, str):
-            return [int(x) for x in v.split(",") if x.strip()]
+            return [x.strip() for x in v.split(",") if x.strip()]
         return v
 
-    @field_validator("mirror_path", "ingest_limit", mode="before")
+    @field_validator("local_data_path", mode="before")
     @classmethod
     def empty_to_none(cls, v):
         if v == "" or v is None:
@@ -46,14 +48,10 @@ class Settings(BaseModel):
     @property
     def dataset_urls(self) -> List[str]:
         urls = []
-        for gid in self.dataset_ids:
-            urls.append(f"https://www.gutenberg.org/cache/epub/{gid}/pg{gid}.txt")
-            urls.append(f"https://www.gutenberg.org/files/{gid}/{gid}-0.txt")
+        for name in self.dataset_names:
+            safe = name.strip().replace(" ", "_")
+            urls.append(f"{self.dataset_base_url}/reviews_{safe}_5.json.gz")
         return urls
-
-    @property
-    def is_mirror_mode(self) -> bool:
-        return self.ingest_mode.lower() == "mirror"
 
 
 @lru_cache(maxsize=1)

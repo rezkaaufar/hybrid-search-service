@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpass}
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-ragdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpass}@db:5432/${POSTGRES_DB:-ragdb}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - CHUNK_SIZE=${CHUNK_SIZE:-450}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-80}
+      - DATASET_IDS=${DATASET_IDS:-1342,1661,98}
+      - INGEST_MODE=${INGEST_MODE:-ids}
+      - GUTENBERG_MIRROR_PATH=${GUTENBERG_MIRROR_PATH:-}
+      - INGEST_LIMIT=${INGEST_LIMIT:-}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+      - PYTHONPATH=/app/src
+    volumes:
+      - ${HOST_GUTENBERG_MIRROR_PATH:-/tmp/gutenberg_mirror}:${GUTENBERG_MIRROR_PATH:-/tmp/gutenberg_mirror}:ro
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "rag_retrieval.api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  db_data:

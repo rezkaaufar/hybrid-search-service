@@ -1,8 +1,10 @@
 from typing import List, Literal, Optional
 
+import anyio
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from rag_retrieval.config import get_settings
 from rag_retrieval.db import get_conn, init_db, init_pool
@@ -10,6 +12,7 @@ from rag_retrieval.embedding import get_embedder
 
 settings = get_settings()
 app = FastAPI(title="RAG Retrieval Service", version="0.1.0")
+embed_semaphore = anyio.Semaphore(settings.embed_concurrency)
 
 
 class QueryRequest(BaseModel):
@@ -72,8 +75,11 @@ def run_lexical(query: str, k: int) -> List[ChunkResult]:
 
 
 def run_semantic(query: str, k: int) -> List[ChunkResult]:
-    embedder = get_embedder()
-    vector = embedder.embed([query])[0].tolist()
+    vector = _embed_one(query)
+    return run_semantic_with_vector(vector, k)
+
+
+def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
     stmt = """
     SELECT c.id, c.document_id, c.content, d.url, d.title, (c.embedding <-> %s::vector) AS distance
     FROM chunks c
@@ -96,6 +102,17 @@ def run_semantic(query: str, k: int) -> List[ChunkResult]:
         )
         for row in rows
     ]
+
+
+def _embed_one(query: str) -> List[float]:
+    embedder = get_embedder()
+    return embedder.embed([query])[0].tolist()
+
+
+async def embed_async_one(query: str) -> List[float]:
+    # Limit concurrent embeddings to avoid CPU saturation and potential model thread-safety issues
+    async with embed_semaphore:
+        return await anyio.to_thread.run_sync(_embed_one, query)
 
 
 def fuse_scores(lexical: List[ChunkResult], semantic: List[ChunkResult], k: int) -> List[ChunkResult]:
@@ -124,18 +141,21 @@ def fuse_scores(lexical: List[ChunkResult], semantic: List[ChunkResult], k: int)
 
 
 @app.post("/query", response_model=QueryResponse)
-def query(payload: QueryRequest):
+async def query(payload: QueryRequest):
     if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     mode = payload.mode
     if mode == "lexical":
-        results = run_lexical(payload.query, payload.k)
+        results = await run_in_threadpool(run_lexical, payload.query, payload.k)
     elif mode == "semantic":
-        results = run_semantic(payload.query, payload.k)
+        vector = await embed_async_one(payload.query)
+        results = await run_in_threadpool(run_semantic_with_vector, vector, payload.k)
     else:
-        lexical = run_lexical(payload.query, payload.k)
-        semantic = run_semantic(payload.query, payload.k)
+        lexical_task = run_in_threadpool(run_lexical, payload.query, payload.k)
+        vector_task = embed_async_one(payload.query)
+        lexical, vector = await anyio.gather(lexical_task, vector_task)
+        semantic = await run_in_threadpool(run_semantic_with_vector, vector, payload.k)
         results = fuse_scores(lexical, semantic, payload.k)
 
     return QueryResponse(mode=mode, results=results)

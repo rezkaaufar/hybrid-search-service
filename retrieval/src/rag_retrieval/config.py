@@ -20,6 +20,7 @@ class Settings(BaseModel):
     max_workers: int = Field(4, alias="MAX_WORKERS")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     request_timeout: int = Field(30, alias="REQUEST_TIMEOUT")
+    embed_concurrency: int = Field(2, alias="EMBED_CONCURRENCY", ge=1)
 
     class Config:
         populate_by_name = True

@@ -1,33 +1,40 @@
 import contextlib
-from typing import Iterator, Optional
+from typing import AsyncIterator, Optional
 
 import psycopg
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool
 
 from rag_retrieval.config import get_settings
 
 settings = get_settings()
 
-pool: Optional[ConnectionPool] = None
+pool: Optional[AsyncConnectionPool] = None
 
 
-def init_pool():
+async def init_pool() -> AsyncConnectionPool:
     global pool
     if pool is None:
-        pool = ConnectionPool(conninfo=settings.database_url, min_size=1, max_size=10, timeout=30)
+        pool = AsyncConnectionPool(conninfo=settings.database_url, min_size=1, max_size=10, timeout=30)
     return pool
 
 
-@contextlib.contextmanager
-def get_conn() -> Iterator[psycopg.Connection]:
+@contextlib.asynccontextmanager
+async def get_conn() -> AsyncIterator[psycopg.AsyncConnection]:
     if pool is None:
-        init_pool()
+        await init_pool()
     assert pool is not None
-    with pool.connection() as conn:
+    async with pool.connection() as conn:
         yield conn
 
 
-def init_db():
+@contextlib.contextmanager
+def get_sync_conn() -> AsyncIterator[psycopg.Connection]:
+    # For offline scripts (ingest) that prefer synchronous access.
+    with psycopg.connect(settings.database_url) as conn:
+        yield conn
+
+
+async def init_db():
     ddl = f"""
     CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -57,14 +64,14 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_chunks_tsv ON chunks USING GIN (tsv_content);
     """
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(ddl)
-            cur.execute(indexes)
-            conn.commit()
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(ddl)
+            await cur.execute(indexes)
+        await conn.commit()
 
 
-def create_vector_index():
+async def create_vector_index():
     # ivfflat needs rows present; safe to run after inserts
     stmt = """
     DO $$
@@ -78,7 +85,19 @@ def create_vector_index():
         END IF;
     END $$;
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(stmt)
-            conn.commit()
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(stmt)
+        await conn.commit()
+
+
+def init_db_sync():
+    import asyncio
+
+    asyncio.run(init_db())
+
+
+def create_vector_index_sync():
+    import asyncio
+
+    asyncio.run(create_vector_index())

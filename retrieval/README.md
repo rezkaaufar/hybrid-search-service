@@ -66,7 +66,7 @@ curl -X POST http://localhost:8000/query \
 ## Notes
 - Embeddings and inference run on CPU by default; no CUDA required.
 - Initial model download happens on first run; cache persists inside container or local env.
-- Extend by adding more Gutenberg IDs to `DATASET_IDS` or overriding the embedding model.
+- Dataset: Amazon product reviews from the SNAP catalog (categories in `DATASET_NAMES`). Adjust those env vars to change which review files are ingested.
 
 ## Load test with k6
 Prereqs: Docker (or k6 binary). Start the app first (e.g., `docker compose up`).

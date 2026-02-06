@@ -1,10 +1,10 @@
 from typing import List, Literal, Optional
 
 import anyio
+import asyncio
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
 
 from rag_retrieval.config import get_settings
 from rag_retrieval.db import get_conn, init_db, init_pool
@@ -36,9 +36,9 @@ class QueryResponse(BaseModel):
 
 
 @app.on_event("startup")
-def startup_event():
-    init_pool()
-    init_db()
+async def startup_event():
+    await init_pool()
+    await init_db()
     get_embedder()
 
 
@@ -47,7 +47,7 @@ def health():
     return {"status": "ok"}
 
 
-def run_lexical(query: str, k: int) -> List[ChunkResult]:
+async def run_lexical(query: str, k: int) -> List[ChunkResult]:
     stmt = """
     SELECT c.id, c.document_id, c.content, d.url, d.title,
     ts_rank_cd(c.tsv_content, plainto_tsquery('english', %s)) AS score
@@ -57,10 +57,10 @@ def run_lexical(query: str, k: int) -> List[ChunkResult]:
     ORDER BY score DESC
     LIMIT %s;
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(stmt, (query, query, k))
-            rows = cur.fetchall()
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(stmt, (query, query, k))
+            rows = await cur.fetchall()
     return [
         ChunkResult(
             chunk_id=row[0],
@@ -74,12 +74,12 @@ def run_lexical(query: str, k: int) -> List[ChunkResult]:
     ]
 
 
-def run_semantic(query: str, k: int) -> List[ChunkResult]:
+async def run_semantic(query: str, k: int) -> List[ChunkResult]:
     vector = _embed_one(query)
-    return run_semantic_with_vector(vector, k)
+    return await run_semantic_with_vector(vector, k)
 
 
-def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
+async def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
     stmt = """
     SELECT c.id, c.document_id, c.content, d.url, d.title, (c.embedding <-> %s::vector) AS distance
     FROM chunks c
@@ -87,10 +87,10 @@ def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
     ORDER BY c.embedding <-> %s::vector
     LIMIT %s;
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(stmt, (vector, vector, k))
-            rows = cur.fetchall()
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(stmt, (vector, vector, k))
+            rows = await cur.fetchall()
     return [
         ChunkResult(
             chunk_id=row[0],
@@ -147,15 +147,15 @@ async def query(payload: QueryRequest):
 
     mode = payload.mode
     if mode == "lexical":
-        results = await run_in_threadpool(run_lexical, payload.query, payload.k)
+        results = await run_lexical(payload.query, payload.k)
     elif mode == "semantic":
         vector = await embed_async_one(payload.query)
-        results = await run_in_threadpool(run_semantic_with_vector, vector, payload.k)
+        results = await run_semantic_with_vector(vector, payload.k)
     else:
-        lexical_task = run_in_threadpool(run_lexical, payload.query, payload.k)
+        lexical_task = run_lexical(payload.query, payload.k)
         vector_task = embed_async_one(payload.query)
-        lexical, vector = await anyio.gather(lexical_task, vector_task)
-        semantic = await run_in_threadpool(run_semantic_with_vector, vector, payload.k)
+        lexical, vector = await asyncio.gather(lexical_task, vector_task)
+        semantic = await run_semantic_with_vector(vector, payload.k)
         results = fuse_scores(lexical, semantic, payload.k)
 
     return QueryResponse(mode=mode, results=results)

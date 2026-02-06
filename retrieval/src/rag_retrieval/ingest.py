@@ -8,19 +8,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from typing import List, Tuple
 
-import psycopg
 import requests
 from tqdm import tqdm
 
 from rag_retrieval.chunker import chunk_text
 from rag_retrieval.config import get_settings
-from rag_retrieval.db import create_vector_index, get_conn, init_db
+from rag_retrieval.db import create_vector_index_sync, get_sync_conn, init_db_sync
 from rag_retrieval.embedding import get_embedder
 
 logger = logging.getLogger(__name__)
 
 
-def upsert_document(conn: psycopg.Connection, source_id: str, title: str, url: str, checksum: str) -> int:
+def upsert_document(conn, source_id: str, title: str, url: str, checksum: str) -> int:
     stmt = """
     INSERT INTO documents (source_id, title, url, checksum)
     VALUES (%s, %s, %s, %s)
@@ -34,7 +33,7 @@ def upsert_document(conn: psycopg.Connection, source_id: str, title: str, url: s
         return doc_id
 
 
-def insert_chunks(conn: psycopg.Connection, document_id: int, chunks: List[Tuple[str, int]], embeddings) -> None:
+def insert_chunks(conn, document_id: int, chunks: List[Tuple[str, int]], embeddings) -> None:
     records = []
     for idx, ((content, token_count), emb) in enumerate(zip(chunks, embeddings)):
         records.append(
@@ -165,7 +164,7 @@ def ingest():
     mode = "local" if settings.local_data_path else "remote"
     logger.info("Starting ingestion (mode=%s)", mode)
 
-    init_db()
+    init_db_sync()
     embedder = get_embedder()
     if embedder.dim != settings.embedding_dim:
         logger.warning("Embedding dim mismatch: config=%s, model=%s", settings.embedding_dim, embedder.dim)
@@ -175,7 +174,7 @@ def ingest():
     else:
         results = ingest_from_remote(settings)
 
-    with get_conn() as conn:
+    with get_sync_conn() as conn:
         for item in tqdm(results, desc="Processing"):
             source_id = item["source_id"]
             url = item["url"]
@@ -189,7 +188,7 @@ def ingest():
             embeddings = embedder.embed(contents, batch_size=32)
             insert_chunks(conn, doc_id, chunks, embeddings)
 
-    create_vector_index()
+    create_vector_index_sync()
     logger.info("Ingestion complete.")
 
 

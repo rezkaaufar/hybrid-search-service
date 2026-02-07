@@ -2,6 +2,7 @@ from typing import List, Literal, Optional
 
 import anyio
 import asyncio
+import logging
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ from rag_retrieval.embedding import get_embedder
 settings = get_settings()
 app = FastAPI(title="RAG Retrieval Service", version="0.1.0")
 embed_semaphore = anyio.Semaphore(settings.embed_concurrency)
+logger = logging.getLogger(__name__)
 
 
 class QueryRequest(BaseModel):
@@ -37,9 +39,20 @@ class QueryResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    await init_pool()
-    await init_db()
-    get_embedder()
+    # Initialize pool; if DB is unavailable at startup, log and continue so the container becomes healthy.
+    try:
+        await init_pool()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("DB pool init failed at startup: %s", exc)
+    try:
+        await init_db()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("DB init failed at startup (will retry on demand): %s", exc)
+    # Warm embedder (may download model on first run).
+    try:
+        get_embedder()
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Embedder warmup failed at startup: %s", exc)
 
 
 @app.get("/health")

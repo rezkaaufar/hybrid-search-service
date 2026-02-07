@@ -193,6 +193,6 @@ def ingest():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest Gutenberg documents into Postgres with pgvector.")
+    parser = argparse.ArgumentParser(description="Ingest Amazon reviews documents into Postgres with pgvector.")
     args = parser.parse_args()
     ingest()

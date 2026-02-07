@@ -15,8 +15,15 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the embedding model to avoid runtime rate limits on Hugging Face
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')"
+
+# Runtime: force offline to avoid HF calls
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
+
 COPY src /app/src
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["uvicorn", "rag_retrieval.api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn rag_retrieval.api:app --host 0.0.0.0 --port ${PORT:-8080}"]

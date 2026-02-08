@@ -1,3 +1,4 @@
+import os
 from typing import List
 
 import numpy as np
@@ -9,7 +10,9 @@ from rag_retrieval.config import get_settings
 class Embedder:
     def __init__(self):
         settings = get_settings()
-        self.model = SentenceTransformer(settings.embedding_model, device="cpu")
+        # Prefer a locally baked model path if available to avoid HF calls
+        model_path = os.getenv("MODEL_LOCAL_PATH", settings.embedding_model)
+        self.model = SentenceTransformer(model_path, device="cpu")
         self.dim = self.model.get_sentence_embedding_dimension()
 
     def embed(self, texts: List[str], batch_size: int = 32) -> np.ndarray:

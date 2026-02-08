@@ -1,10 +1,12 @@
 FROM python:3.11-slim
 
+ARG HF_TOKEN=""
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     TOKENIZERS_PARALLELISM=false \
-    PYTHONPATH=/app/src
+    PYTHONPATH=/app/src \
+    HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 
 WORKDIR /app
 
@@ -15,12 +17,13 @@ RUN apt-get update && \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the embedding model to avoid runtime rate limits on Hugging Face
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu')"
+# Download and persist the embedding model locally (uses HF token if provided)
+RUN python -c "from sentence_transformers import SentenceTransformer; m=SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device='cpu'); m.save('/app/models/all-MiniLM-L6-v2')"
 
 # Runtime: force offline to avoid HF calls
 ENV HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1
+    TRANSFORMERS_OFFLINE=1 \
+    MODEL_LOCAL_PATH=/app/models/all-MiniLM-L6-v2
 
 COPY src /app/src
 

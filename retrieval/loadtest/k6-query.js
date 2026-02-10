@@ -27,11 +27,11 @@ export const options = {
   scenarios: {
     constant_load: {
       executor: "constant-arrival-rate",
-      rate: Number(__ENV.RPS || 20), // requests per second
+      rate: Number(__ENV.RPS || 50), // requests per second
       timeUnit: "1s",
-      duration: __ENV.DURATION || "2m",
-      preAllocatedVUs: Number(__ENV.VUS || 50),
-      maxVUs: Number(__ENV.MAX_VUS || 200),
+      duration: __ENV.DURATION || "5m",
+      preAllocatedVUs: Number(__ENV.VUS || 100),
+      maxVUs: Number(__ENV.MAX_VUS || 400),
     },
   },
   thresholds: {

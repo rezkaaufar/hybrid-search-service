@@ -4,9 +4,8 @@ import hashlib
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
-from typing import List, Tuple
+from io import TextIOWrapper
+from typing import Generator, List, Tuple
 
 import requests
 from tqdm import tqdm
@@ -23,7 +22,10 @@ def upsert_document(conn, source_id: str, title: str, url: str, checksum: str) -
     stmt = """
     INSERT INTO documents (source_id, title, url, checksum)
     VALUES (%s, %s, %s, %s)
-    ON CONFLICT (source_id) DO UPDATE SET checksum = EXCLUDED.checksum
+    ON CONFLICT (source_id) DO UPDATE
+      SET title = EXCLUDED.title,
+          url = EXCLUDED.url,
+          checksum = EXCLUDED.checksum
     RETURNING id;
     """
     with conn.cursor() as cur:
@@ -31,6 +33,13 @@ def upsert_document(conn, source_id: str, title: str, url: str, checksum: str) -
         doc_id = cur.fetchone()[0]
         conn.commit()
         return doc_id
+
+
+def replace_chunks(conn, document_id: int) -> None:
+    stmt = "DELETE FROM chunks WHERE document_id = %s;"
+    with conn.cursor() as cur:
+        cur.execute(stmt, (document_id,))
+    conn.commit()
 
 
 def insert_chunks(conn, document_id: int, chunks: List[Tuple[str, int]], embeddings) -> None:
@@ -69,34 +78,38 @@ def parse_review_record(record: dict) -> str:
     return combined
 
 
-def download_and_parse_dataset(name: str, url: str, max_reviews: int | None, timeout: int):
+def stream_remote_dataset(
+    name: str, url: str, max_reviews: int | None, timeout: int
+) -> Generator[dict, None, None]:
     logger.info("Downloading dataset %s from %s", name, url)
-    resp = requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    reviews = []
-    with gzip.open(BytesIO(resp.content), "rt", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            content = parse_review_record(record)
-            if not content:
-                continue
-            asin = record.get("asin", "unknown")
-            reviewer = record.get("reviewerID", "unknown")
-            source_id = f"{name}:{asin}:{reviewer}:{len(reviews)}"
-            title = f"{name} review {asin}"
-            reviews.append({"source_id": source_id, "url": url, "text": content, "title": title})
-            if max_reviews and len(reviews) >= max_reviews:
-                break
-    logger.info("Parsed %d reviews from %s", len(reviews), name)
-    return reviews
+    count = 0
+    with requests.get(url, stream=True, timeout=timeout) as resp:
+        resp.raise_for_status()
+        resp.raw.decode_content = True
+        with gzip.GzipFile(fileobj=resp.raw) as gz:
+            with TextIOWrapper(gz, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    content = parse_review_record(record)
+                    if not content:
+                        continue
+                    asin = record.get("asin", "unknown")
+                    reviewer = record.get("reviewerID", "unknown")
+                    source_id = f"{name}:{asin}:{reviewer}:{count}"
+                    title = f"{name} review {asin}"
+                    yield {"source_id": source_id, "url": url, "text": content, "title": title}
+                    count += 1
+                    if max_reviews and count >= max_reviews:
+                        break
+    logger.info("Parsed %d reviews from %s", count, name)
 
 
-def load_local_dataset(path: str, name: str, max_reviews: int | None):
-    reviews = []
+def stream_local_dataset(path: str, name: str, max_reviews: int | None) -> Generator[dict, None, None]:
     logger.info("Loading local dataset %s from %s", name, path)
+    count = 0
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -109,35 +122,24 @@ def load_local_dataset(path: str, name: str, max_reviews: int | None):
                 continue
             asin = record.get("asin", "unknown")
             reviewer = record.get("reviewerID", "unknown")
-            source_id = f"{name}:{asin}:{reviewer}:{len(reviews)}"
+            source_id = f"{name}:{asin}:{reviewer}:{count}"
             title = f"{name} review {asin}"
-            reviews.append({"source_id": source_id, "url": f"file://{os.path.abspath(path)}", "text": content, "title": title})
-            if max_reviews and len(reviews) >= max_reviews:
+            yield {"source_id": source_id, "url": f"file://{os.path.abspath(path)}", "text": content, "title": title}
+            count += 1
+            if max_reviews and count >= max_reviews:
                 break
-    logger.info("Parsed %d reviews from local %s", len(reviews), name)
-    return reviews
+    logger.info("Parsed %d reviews from local %s", count, name)
 
 
-def ingest_from_remote(settings):
-    jobs = []
-    with ThreadPoolExecutor(max_workers=settings.max_workers) as executor:
-        for name, url in zip(settings.dataset_names, settings.dataset_urls):
-            jobs.append(
-                executor.submit(
-                    download_and_parse_dataset,
-                    name,
-                    url,
-                    settings.max_reviews_per_dataset,
-                    settings.request_timeout,
-                )
-            )
-        results = []
-        for future in tqdm(as_completed(jobs), total=len(jobs), desc="Downloading"):
-            results.extend(future.result())
-    return results
+def ingest_from_remote(settings) -> Generator[dict, None, None]:
+    for name, url in zip(settings.dataset_names, settings.dataset_urls):
+        try:
+            yield from stream_remote_dataset(name, url, settings.max_reviews_per_dataset, settings.request_timeout)
+        except requests.RequestException as e:
+            logger.warning("Skipping dataset %s (%s): %s", name, url, e)
 
 
-def ingest_from_local(settings):
+def ingest_from_local(settings) -> Generator[dict, None, None]:
     if not settings.local_data_path or not os.path.isdir(settings.local_data_path):
         raise RuntimeError("LOCAL_DATA_PATH is not set or not a directory for local ingest")
     files = []
@@ -147,15 +149,9 @@ def ingest_from_local(settings):
                 files.append(os.path.join(root, fname))
     if not files:
         raise RuntimeError("No .json/.jsonl/.json.gz files found under LOCAL_DATA_PATH")
-    reviews = []
-    with ThreadPoolExecutor(max_workers=settings.max_workers) as executor:
-        futures = []
-        for path in files:
-            name = os.path.splitext(os.path.basename(path))[0]
-            futures.append(executor.submit(load_local_dataset, path, name, settings.max_reviews_per_dataset))
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading local"):
-            reviews.extend(future.result())
-    return reviews
+    for path in sorted(files):
+        name = os.path.splitext(os.path.basename(path))[0]
+        yield from stream_local_dataset(path, name, settings.max_reviews_per_dataset)
 
 
 def ingest():
@@ -170,12 +166,12 @@ def ingest():
         logger.warning("Embedding dim mismatch: config=%s, model=%s", settings.embedding_dim, embedder.dim)
 
     if settings.local_data_path:
-        results = ingest_from_local(settings)
+        results_iter = ingest_from_local(settings)
     else:
-        results = ingest_from_remote(settings)
+        results_iter = ingest_from_remote(settings)
 
     with get_sync_conn() as conn:
-        for item in tqdm(results, desc="Processing"):
+        for item in tqdm(results_iter, desc="Processing", unit="review"):
             source_id = item["source_id"]
             url = item["url"]
             text = item["text"]
@@ -183,6 +179,7 @@ def ingest():
 
             checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
             doc_id = upsert_document(conn, str(source_id), title, url, checksum)
+            replace_chunks(conn, doc_id)
             chunks = chunk_text(text, chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
             contents = [c[0] for c in chunks]
             embeddings = embedder.embed(contents, batch_size=32)

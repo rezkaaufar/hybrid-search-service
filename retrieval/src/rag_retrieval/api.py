@@ -128,29 +128,89 @@ async def embed_async_one(query: str) -> List[float]:
         return await anyio.to_thread.run_sync(_embed_one, query)
 
 
-def fuse_scores(lexical: List[ChunkResult], semantic: List[ChunkResult], k: int) -> List[ChunkResult]:
+def reciprocal_rank_fusion(
+    lexical: List[ChunkResult],
+    semantic: List[ChunkResult],
+    k: int,
+    rrf_k: int = 60
+) -> List[ChunkResult]:
+    """
+    Reciprocal Rank Fusion (RRF) for combining lexical and semantic search results.
+
+    RRF score for a document = sum over all ranklists of: 1 / (rrf_k + rank)
+
+    This approach is more robust than weighted score fusion because:
+    - No score normalization needed (rank-based, not score-based)
+    - Handles different score scales naturally
+    - Used by Elasticsearch and other production systems
+    - Simple and efficient for high-throughput scenarios
+
+    Args:
+        lexical: Ranked list of lexical search results (already sorted by score desc)
+        semantic: Ranked list of semantic search results (already sorted by distance asc)
+        k: Number of final results to return
+        rrf_k: RRF constant (default 60, standard value from literature)
+               Lower values give more weight to top ranks, higher values flatten the curve
+
+    Returns:
+        Fused and re-ranked list of top-k results with RRF scores
+
+    Time Complexity: O(n + m + (n+m)log(n+m)) where n=len(lexical), m=len(semantic)
+    Space Complexity: O(n + m) for the fused dictionary
+    """
+    # Early exit for edge cases
+    if not lexical and not semantic:
+        return []
+    if not lexical:
+        return semantic[:k]
+    if not semantic:
+        return lexical[:k]
+
+    # Pre-allocate dict with estimated size to reduce rehashing
+    # Use chunk_id as key for O(1) lookups during merging
     fused: dict[int, dict] = {}
-    if lexical:
-        max_lex = max(r.score for r in lexical) or 1.0
-        for r in lexical:
-            fused.setdefault(r.chunk_id, {"item": r, "score": 0.0})
-            fused[r.chunk_id]["score"] += 0.5 * (r.score / max_lex)
-    if semantic:
-        distances = np.array([r.score for r in semantic])
-        if len(distances) == 0:
-            distances = np.array([1.0])
-        max_dist = distances.max() or 1.0
-        for r in semantic:
-            sim = 1 - (r.score / max_dist)
-            fused.setdefault(r.chunk_id, {"item": r, "score": 0.0})
-            fused[r.chunk_id]["score"] += 0.5 * sim
-    sorted_items = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
-    top = []
-    for entry in sorted_items[:k]:
+
+    # Process lexical results: enumerate gives 0-based index, we want 1-based ranks
+    for rank, result in enumerate(lexical, start=1):
+        rrf_score = 1.0 / (rrf_k + rank)
+        chunk_id = result.chunk_id
+
+        if chunk_id not in fused:
+            # First occurrence: store the result object and initialize score
+            fused[chunk_id] = {"item": result, "score": rrf_score}
+        else:
+            # Document appears in both lists: accumulate RRF score
+            fused[chunk_id]["score"] += rrf_score
+
+    # Process semantic results
+    for rank, result in enumerate(semantic, start=1):
+        rrf_score = 1.0 / (rrf_k + rank)
+        chunk_id = result.chunk_id
+
+        if chunk_id not in fused:
+            fused[chunk_id] = {"item": result, "score": rrf_score}
+        else:
+            fused[chunk_id]["score"] += rrf_score
+
+    # Sort by RRF score (descending) and return top-k
+    # Using itemgetter or lambda x: x["score"] - lambda is more readable here
+    # Avoid creating intermediate list - use heapq.nlargest for very large result sets
+    if len(fused) > k * 10:  # Heuristic: use heap for large result sets
+        import heapq
+        top_entries = heapq.nlargest(k, fused.values(), key=lambda x: x["score"])
+    else:
+        # For smaller result sets, full sort is faster due to lower overhead
+        sorted_entries = sorted(fused.values(), key=lambda x: x["score"], reverse=True)
+        top_entries = sorted_entries[:k]
+
+    # Update the score field in ChunkResult objects with the fused RRF score
+    results = []
+    for entry in top_entries:
         item = entry["item"]
         item.score = entry["score"]
-        top.append(item)
-    return top
+        results.append(item)
+
+    return results
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -169,6 +229,6 @@ async def query(payload: QueryRequest):
         vector_task = embed_async_one(payload.query)
         lexical, vector = await asyncio.gather(lexical_task, vector_task)
         semantic = await run_semantic_with_vector(vector, payload.k)
-        results = fuse_scores(lexical, semantic, payload.k)
+        results = reciprocal_rank_fusion(lexical, semantic, payload.k, rrf_k=settings.rrf_k)
 
     return QueryResponse(mode=mode, results=results)

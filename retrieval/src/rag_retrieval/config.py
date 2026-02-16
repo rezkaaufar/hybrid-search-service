@@ -21,6 +21,7 @@ class Settings(BaseModel):
     log_level: str = Field("INFO", alias="LOG_LEVEL")
     request_timeout: int = Field(30, alias="REQUEST_TIMEOUT")
     embed_concurrency: int = Field(2, alias="EMBED_CONCURRENCY", ge=1)
+    rrf_k: int = Field(60, alias="RRF_K", ge=1, le=1000)
 
     class Config:
         populate_by_name = True

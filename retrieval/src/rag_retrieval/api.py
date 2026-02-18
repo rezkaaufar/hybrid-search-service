@@ -3,6 +3,7 @@ from typing import List, Literal, Optional
 import anyio
 import asyncio
 import logging
+import time
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -61,6 +62,7 @@ def health():
 
 
 async def run_lexical(query: str, k: int) -> List[ChunkResult]:
+    start = time.perf_counter()
     stmt = """
     SELECT c.id, c.document_id, c.content, d.url, d.title,
     ts_rank_cd(c.tsv_content, plainto_tsquery('english', %s)) AS score
@@ -74,6 +76,8 @@ async def run_lexical(query: str, k: int) -> List[ChunkResult]:
         async with conn.cursor() as cur:
             await cur.execute(stmt, (query, query, k))
             rows = await cur.fetchall()
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(f"TIMING: lexical search took {duration_ms:.2f}ms")
     return [
         ChunkResult(
             chunk_id=row[0],
@@ -93,6 +97,7 @@ async def run_semantic(query: str, k: int) -> List[ChunkResult]:
 
 
 async def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
+    start = time.perf_counter()
     stmt = """
     SELECT c.id, c.document_id, c.content, d.url, d.title, (c.embedding <-> %s::vector) AS distance
     FROM chunks c
@@ -104,6 +109,8 @@ async def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkRes
         async with conn.cursor() as cur:
             await cur.execute(stmt, (vector, vector, k))
             rows = await cur.fetchall()
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(f"TIMING: semantic search (vector query) took {duration_ms:.2f}ms")
     return [
         ChunkResult(
             chunk_id=row[0],
@@ -124,8 +131,12 @@ def _embed_one(query: str) -> List[float]:
 
 async def embed_async_one(query: str) -> List[float]:
     # Limit concurrent embeddings to avoid CPU saturation and potential model thread-safety issues
+    start = time.perf_counter()
     async with embed_semaphore:
-        return await anyio.to_thread.run_sync(_embed_one, query)
+        result = await anyio.to_thread.run_sync(_embed_one, query)
+    duration_ms = (time.perf_counter() - start) * 1000
+    logger.info(f"TIMING: embedding took {duration_ms:.2f}ms")
+    return result
 
 
 def reciprocal_rank_fusion(
@@ -215,6 +226,7 @@ def reciprocal_rank_fusion(
 
 @app.post("/query", response_model=QueryResponse)
 async def query(payload: QueryRequest):
+    start = time.perf_counter()
     if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
@@ -231,4 +243,6 @@ async def query(payload: QueryRequest):
         semantic = await run_semantic_with_vector(vector, payload.k)
         results = reciprocal_rank_fusion(lexical, semantic, payload.k, rrf_k=settings.rrf_k)
 
+    total_ms = (time.perf_counter() - start) * 1000
+    logger.info(f"TIMING: total query ({mode}) took {total_ms:.2f}ms")
     return QueryResponse(mode=mode, results=results)

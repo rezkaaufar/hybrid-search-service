@@ -99,10 +99,10 @@ async def run_semantic(query: str, k: int) -> List[ChunkResult]:
 async def run_semantic_with_vector(vector: List[float], k: int) -> List[ChunkResult]:
     start = time.perf_counter()
     stmt = """
-    SELECT c.id, c.document_id, c.content, d.url, d.title, (c.embedding <-> %s::vector) AS distance
+    SELECT c.id, c.document_id, c.content, d.url, d.title, (c.embedding <#> %s::vector) AS distance
     FROM chunks c
     JOIN documents d ON d.id = c.document_id
-    ORDER BY c.embedding <-> %s::vector
+    ORDER BY c.embedding <#> %s::vector
     LIMIT %s;
     """
     async with get_conn() as conn:

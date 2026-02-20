@@ -72,7 +72,7 @@ async def init_db():
 
 
 async def create_vector_index():
-    # ivfflat needs rows present; safe to run after inserts
+    # hnsw needs rows present; safe to run after inserts
     stmt = """
     DO $$
     BEGIN
@@ -81,7 +81,7 @@ async def create_vector_index():
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE c.relname = 'idx_chunks_embedding'
         ) THEN
-            CREATE INDEX idx_chunks_embedding ON chunks USING ivfflat (embedding vector_l2_ops) WITH (lists = 100);
+            CREATE INDEX idx_chunks_embedding ON chunks USING hnsw (embedding vector_ip_ops) WITH (m = 16, ef_construction = 64);
         END IF;
     END $$;
     """

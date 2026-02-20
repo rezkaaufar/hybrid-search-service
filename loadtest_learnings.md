@@ -10,14 +10,15 @@
 
 ## Executive Summary
 
-Through systematic load testing across multiple configurations, we identified and resolved the **vector search bottleneck** by migrating from IVFFLAT to HNSW index, achieving **2× improvement in semantic search throughput** (97 → 205 RPS). However, we're still at **~40% of target throughput** due to architectural limitations.
+Through systematic load testing across multiple configurations, we identified and resolved the **vector search bottleneck** by migrating from IVFFLAT to HNSW index, achieving **2× improvement in semantic search throughput** (97 → 205 RPS) and **49% improvement in hybrid search** (181 → 270 RPS). However, we're still at **~54% of target throughput** due to architectural limitations and resource saturation.
 
 ### Key Findings:
 1. ✅ **Vector search bottleneck SOLVED:** HNSW index delivers 2× faster queries than IVFFLAT (205 RPS vs 97 RPS)
-2. ✅ **Embedding concurrency SOLVED:** Increased from 1 to 6, utilizing all 8 CPUs
-3. ⚠️ **Full-text search is now the bottleneck:** 220 RPS with 593ms median latency
-4. ⚠️ **Architecture limits scalability:** Two-query design + application-level fusion prevents reaching 500 RPS target
-5. ❌ **Failure rates increase under load:** 7.7% at 205 RPS indicates resource saturation
+2. ✅ **Hybrid search achieves best throughput:** 270 RPS - unexpectedly faster than individual modes due to parallel execution
+3. ✅ **Embedding concurrency SOLVED:** Increased from 1 to 6, utilizing all 8 CPUs
+4. ⚠️ **System saturation reached:** 270 RPS ceiling with 5.95% failures, 3.97s median latency
+5. ⚠️ **Architecture limits scalability:** Two-query design + application-level fusion prevents reaching 500 RPS target
+6. ⚠️ **Full-text search needs optimization:** 220 RPS with 593ms median latency
 
 ### Dataset:
 - **135,329 chunks** in the database
@@ -25,17 +26,22 @@ Through systematic load testing across multiple configurations, we identified an
 - HNSW configuration: M=16, efConstruction=64
 
 ### Performance Journey:
-| Optimization | Semantic RPS | Improvement | Status |
-|--------------|--------------|-------------|--------|
-| Baseline (IVFFLAT, EMBED=1) | 97 | - | ❌ Bottleneck identified |
-| HNSW + EMBED_CONCURRENCY=6 | **205** | **+111%** | ✅ Vector search solved |
-| Target | 500+ | - | ❌ Need architecture change |
+| Optimization | Semantic RPS | Hybrid RPS | Improvement | Status |
+|--------------|--------------|------------|-------------|--------|
+| Baseline (IVFFLAT, EMBED=1) | 97 | 147 | - | ❌ Bottleneck identified |
+| IVFFLAT + EMBED_CONCURRENCY=6 | ~120* | 181 | +23% hybrid | ✅ CPU utilized |
+| HNSW + EMBED_CONCURRENCY=6 | **205** | **270** | **+111% semantic, +49% hybrid** | ✅ Vector search solved |
+| Target | 500+ | 500+ | - | ❌ Need architecture change |
+
+*estimated based on hybrid mode improvement
 
 ### Recommended Actions:
-1. ✅ **DONE:** Migrated to HNSW index (2× improvement achieved)
+1. ✅ **DONE:** Migrated to HNSW index (2× semantic, 1.5× hybrid improvement achieved)
 2. ✅ **DONE:** Increased EMBED_CONCURRENCY to 6
-3. ⏳ **Next:** Optimize full-text search (ts_rank, denormalize JOIN) → ~300 RPS
-4. 🎯 **Long-term:** Migrate to Milvus for 500+ RPS (architectural requirement)
+3. ✅ **DONE:** Tested hybrid mode with HNSW - achieved 270 RPS (54% of target)
+4. ⏳ **Next:** Fix resource saturation (connection pool, monitoring) → reduce 5.95% failures to <2%
+5. ⏳ **Next:** Optimize full-text search (ts_rank, denormalize JOIN) → ~300 RPS
+6. 🎯 **Long-term:** Migrate to Milvus for 500+ RPS (architectural requirement for >300 RPS)
 
 ---
 
@@ -302,6 +308,104 @@ With HNSW, vector search (205 RPS) is now **on par with text search (220 RPS)**.
 
 ---
 
+### Test 6: Hybrid Mode with HNSW Index (Full Optimization)
+
+**Configuration:**
+- Mode: `hybrid` (lexical + semantic with RRF fusion)
+- Vector index: **HNSW** (upgraded from IVFFLAT)
+- HNSW parameters: M=16, efConstruction=64
+- EMBED_CONCURRENCY: 6
+- Dataset: 135,329 chunks
+- Target: 500 RPS
+
+**Results:**
+
+| Metric | Value | Comparison to IVFFLAT Hybrid | Status |
+|--------|-------|------------------------------|--------|
+| **Actual RPS** | 270 | **+49% (181 → 270)** | ✅✅ Major improvement |
+| **Median Latency** | 3.97s | **+106% (1.93s → 3.97s)** | ❌ Worse |
+| **P95 Latency** | 16.96s | -18% (20.59s → 16.96s) | ✅ Slightly better |
+| **P99 Latency** | 19.82s | -29% (28.07s → 19.82s) | ✅ Better |
+| **Success Rate** | 94.05% | -2.73% (96.78% → 94.05%) | ⚠️ Decreased |
+| **Failure Rate** | 5.95% | +85% (3.22% → 5.95%) | ❌ Increased |
+| **Dropped Iterations** | 19,845 | -79% (92,573 → 19,845) | ✅✅ Much better |
+| **Max VUs Used** | 2000 | 0% | ⚠️ Still hitting limit |
+
+**Analysis:**
+
+**✅ Major Wins:**
+1. **Throughput increased 49%:** 181 → 270 RPS with HNSW index
+2. **Hybrid now FASTER than individual modes:** Counterintuitively, hybrid (270 RPS) > semantic (205 RPS) > lexical (220 RPS)
+   - This suggests different resource contention patterns at different load levels
+   - The parallel execution of lexical + embedding may help distribute load across different resources
+3. **Tail latency improved:** P95 down 18%, P99 down 29% vs IVFFLAT hybrid
+4. **Dropped iterations drastically reduced:** 92k → 20k (-79%) indicates better throughput consistency
+5. **HNSW impact confirmed for hybrid:** The vector search improvement cascades to hybrid mode
+
+**⚠️ Concerns:**
+1. **Median latency increased:** 1.93s → 3.97s (2× slower)
+   - Paradox: Higher RPS but higher latency
+   - Explanation: System is now saturated at 270 RPS (closer to max capacity)
+   - At lower load (181 RPS), latency was better but throughput was limited
+   - At higher load (270 RPS), more requests complete but individual requests wait longer in queues
+2. **Failure rate increased:** 3.22% → 5.95% (+85%)
+   - System is handling **49% more load** (181 → 270 RPS)
+   - Indicates resource saturation (likely connection pool, CPU, or memory limits)
+   - At equivalent load (181 RPS), HNSW would have much lower failures
+3. **Still far from target:** 270 RPS vs 500 RPS (54% of goal)
+
+**Critical Insight: System Saturation Reached**
+
+The test reveals we've hit an **architectural ceiling around 270 RPS**:
+- All VUs maxed out (2000)
+- Failure rate approaching 6%
+- Median latency increased despite better throughput
+- Further load would degrade reliability significantly
+
+**Hybrid Mode Paradox Explained:**
+
+Why is hybrid (270 RPS) faster than individual modes (205-220 RPS)?
+1. **Different resource bottlenecks:**
+   - Lexical: Database CPU bound on text search
+   - Semantic: Embedding CPU bound + vector query
+   - Hybrid: Parallel execution distributes load across both resources
+2. **Better resource utilization:**
+   - While lexical query waits for DB, CPU does embedding
+   - While vector query waits for DB, text search completes
+   - Idle time is minimized through parallelism
+3. **Load distribution:**
+   - Individual modes saturate specific resources
+   - Hybrid mode balances load across multiple resources
+   - Similar to how multi-threaded workloads can outperform single-threaded
+
+**Expected vs Actual:**
+- **Expected:** Hybrid RPS ≈ min(lexical, semantic) = min(220, 205) ≈ 205 RPS
+- **Actual:** Hybrid RPS = 270 RPS (32% better than expected!)
+- **Conclusion:** Parallel execution provides unexpected benefits at high load
+
+**Resource Saturation Evidence:**
+1. **5.95% failure rate** - indicates limits reached
+2. **3.97s median latency** - requests queueing significantly
+3. **VUs maxed at 2000** - k6 cannot send more load
+4. **270 RPS plateau** - throughput ceiling reached
+
+### Current State Summary (All Tests with HNSW)
+
+| Mode | RPS | Median Latency | P95 Latency | Failure Rate | Status |
+|------|-----|----------------|-------------|--------------|--------|
+| **Lexical** | 220 | 593ms | 9.49s | 1.84% | ⚠️ Text search bottleneck |
+| **Semantic (HNSW)** | 205 | 1.42s | 7.48s | 7.70% | ✅ Vector search solved |
+| **Hybrid (HNSW)** | **270** | 3.97s | 16.96s | 5.95% | ✅✅ Best throughput, but saturated |
+| **Target** | 500+ | <100ms | <1s | <1% | ❌ Architecture change needed |
+
+**Key Findings:**
+- ✅ **HNSW migration successful:** Hybrid improved 49% (181 → 270 RPS)
+- ✅ **Parallel execution advantage:** Hybrid outperforms individual modes
+- ⚠️ **System saturation reached:** ~270 RPS is the architectural ceiling
+- ❌ **Still 46% short of target:** Need Milvus or major optimizations to reach 500 RPS
+
+---
+
 ## Performance Comparison Across Modes (Updated with HNSW)
 
 ### Throughput (RPS)
@@ -316,16 +420,17 @@ Target:          █████████████████████
 
 **After HNSW:**
 ```
-Lexical:         ████████████████████ 220 RPS
-Semantic (HNSW): ███████████████████  205 RPS ← 2.1× faster! ✅
-Hybrid (est):    ███████████████████  ~205 RPS (untested, estimated)
+Hybrid (HNSW):   ██████████████████████████ 270 RPS ← fastest! ✅✅
+Lexical:         ████████████████████       220 RPS
+Semantic (HNSW): ███████████████████        205 RPS ← 2.1× faster! ✅
 Target:          ██████████████████████████████████████ 500 RPS
 ```
 
 **Key Insights:**
 - HNSW **SOLVED** the vector search bottleneck: 97 → 205 RPS (+111%)
+- **Hybrid outperforms individual modes:** 270 RPS (parallel execution advantage)
 - Semantic search is now **on par with lexical** (only 7% slower)
-- Both are now limited by architectural constraints, not index performance
+- All modes are now limited by architectural constraints, not index performance
 
 ### Median Latency
 
@@ -341,13 +446,14 @@ Target:            ▌                 <100ms
 ```
 Lexical:           ███               593ms
 Semantic (HNSW):   ████              1.42s  ← 33% faster! ✅
-Hybrid (est):      ███▌              ~1.3s  (untested, estimated)
+Hybrid (HNSW):     ████████████      3.97s  ← saturated at high load ⚠️
 Target:            ▌                 <100ms
 ```
 
 **Key Insights:**
 - HNSW reduced semantic latency by 33% (2.12s → 1.42s)
-- All modes still 5-14× slower than ideal (<100ms target)
+- Hybrid latency increased due to system saturation (handling 270 RPS vs 181 RPS)
+- All modes still 5-40× slower than ideal (<100ms target)
 - Text search (593ms) is now the next optimization target
 
 ### P95 Latency
@@ -364,14 +470,15 @@ Target:            ▌                 <1s
 ```
 Lexical:           ████████████      9.49s
 Semantic (HNSW):   ████████          7.48s  ← 60% faster! ✅✅
-Hybrid (est):      ████████          ~7-8s  (untested, estimated)
+Hybrid (HNSW):     █████████████████ 16.96s ← 18% better than IVFFLAT hybrid ✅
 Target:            ▌                 <1s
 ```
 
 **Key Insights:**
-- HNSW dramatically improved tail latency: 18.53s → 7.48s (-60%)
-- P90 latency improved even more: 14.65s → 4.07s (-72%)
-- Still 7-9× slower than 1s target - architecture and text search remain issues
+- HNSW dramatically improved tail latency: 18.53s → 7.48s (-60%) for semantic
+- Hybrid P95 improved vs IVFFLAT: 20.59s → 16.96s (-18%)
+- P90 latency improved even more: 14.65s → 4.07s (-72%) for semantic
+- Still 7-17× slower than 1s target - architecture and text search remain issues
 
 ---
 
@@ -1034,13 +1141,13 @@ lexical, vector = await asyncio.gather(lexical_task, vector_task)
 2. ✅ Upgraded to HNSW index - **Result:** +111% semantic RPS (97 → 205)
 3. ✅ Vector search bottleneck SOLVED - semantic now on par with lexical (205 vs 220 RPS)
 
-### Phase 2: Next Steps (This Week)
-1. ⏳ **Test hybrid mode with HNSW** - confirm ~200-210 RPS expected
-2. ⏳ **Fix resource saturation** - reduce 7.7% failure rate to <2%
-   - Check database connection pool limits
+### Phase 2: Completed This Week ✅
+1. ✅ **Tested hybrid mode with HNSW** - achieved **270 RPS** (exceeded 200-210 estimate!)
+2. ⏳ **Fix resource saturation** - reduce 5.95% failure rate to <2%
+   - Check database connection pool limits (likely cause of failures)
    - Monitor CPU/memory usage during load
-   - Tune max_connections if needed
-3. ⏳ **Set min-instances=1** - eliminate cold starts
+   - Tune max_connections and pool_size if needed
+3. ⏳ **Set min-instances=1** - eliminate cold starts (if not already done)
 
 ### Phase 3: Further pgvector Optimizations (1-2 Weeks)
 1. ⏳ Optimize full-text search (ts_rank instead of ts_rank_cd) - **Target:** 350+ RPS
@@ -1123,20 +1230,30 @@ vus_max: 2000
 query_duration_ms: avg=2576.49 min=327.55 med=1555.91 max=23836.22 p(90)=4199.59 p(95)=7913.49
 ```
 
+### Test 6: Hybrid (HNSW + EMBED_CONCURRENCY=6)
+```
+http_req_duration: avg=5.15s min=0s med=3.97s max=22.78s p(90)=11.51s p(95)=16.96s p(99)=19.82s
+http_req_failed: 5.95% (1935/32500)
+http_reqs: 32500 (270.21/s)
+dropped_iterations: 19845
+vus_max: 2000
+query_duration_ms: avg=5324.18 min=298.45 med=4109.33 max=22785.67 p(90)=11635.82 p(95)=17089.44 p(99)=19827.15
+```
+
 ---
 
 ## Conclusion
 
-Through systematic load testing and optimization, we successfully **solved the vector search bottleneck** by migrating from IVFFLAT to HNSW index, achieving **2× improvement in semantic search throughput** (97 → 205 RPS). However, we're still at **~40% of target throughput** (205 vs 500 RPS) due to architectural limitations.
+Through systematic load testing and optimization, we successfully **solved the vector search bottleneck** by migrating from IVFFLAT to HNSW index, achieving **2× improvement in semantic search throughput** (97 → 205 RPS) and **49% improvement in hybrid search** (181 → 270 RPS). However, we're still at **~54% of target throughput** (270 vs 500 RPS) due to architectural limitations and resource saturation.
 
 ### Optimization Journey Summary
 
-| Phase | Optimization | Semantic RPS | Improvement | Status |
-|-------|--------------|--------------|-------------|--------|
-| **Baseline** | IVFFLAT + EMBED=1 | 97 | - | ❌ Bottleneck |
-| **Phase 1** | EMBED_CONCURRENCY=6 | ~120* | +24% | ✅ CPU utilized |
-| **Phase 2** | HNSW index | **205** | **+111%** | ✅ Vector search solved |
-| **Target** | - | 500+ | - | ❌ Need architecture change |
+| Phase | Optimization | Semantic RPS | Hybrid RPS | Improvement | Status |
+|-------|--------------|--------------|------------|-------------|--------|
+| **Baseline** | IVFFLAT + EMBED=1 | 97 | 147 | - | ❌ Bottleneck |
+| **Phase 1** | EMBED_CONCURRENCY=6 | ~120* | 181 | +23% hybrid | ✅ CPU utilized |
+| **Phase 2** | HNSW index | **205** | **270** | **+111% semantic, +49% hybrid** | ✅ Vector search solved |
+| **Target** | - | 500+ | 500+ | - | ❌ Need architecture change |
 
 *estimated based on hybrid mode improvement
 
@@ -1145,24 +1262,27 @@ Through systematic load testing and optimization, we successfully **solved the v
 **✅ Successes:**
 1. **Vector search bottleneck SOLVED:** HNSW delivers 2× faster queries than IVFFLAT
 2. **Embedding concurrency SOLVED:** Full CPU utilization achieved
-3. **Semantic ≈ Lexical:** Vector search (205 RPS) now on par with text search (220 RPS)
-4. **Tail latency improved 60%:** P95 dropped from 18.5s to 7.5s
+3. **Hybrid search achieves best performance:** 270 RPS - unexpectedly faster than individual modes
+4. **Semantic ≈ Lexical:** Vector search (205 RPS) now on par with text search (220 RPS)
+5. **Tail latency improved significantly:** Semantic P95 dropped from 18.5s to 7.5s (-60%)
 
 **⚠️ Remaining Challenges:**
-1. **Architecture limits throughput:** Two-query design + application fusion prevents >300 RPS
-2. **Full-text search still slow:** 593ms median, 9.5s P95 (needs optimization)
-3. **Resource saturation:** 7.7% failure rate at 205 RPS indicates limits reached
-4. **Gap to target:** Still 2.5× short of 500 RPS goal
+1. **System saturation reached:** 270 RPS ceiling with 5.95% failures, 3.97s median latency
+2. **Architecture limits throughput:** Two-query design + application fusion prevents >300 RPS
+3. **Full-text search still slow:** 593ms median, 9.5s P95 (needs optimization)
+4. **Gap to target:** Still 1.85× short of 500 RPS goal
 
 ### Current State (With HNSW)
 
 **What works well:**
+- Hybrid search throughput (270 RPS - best performance across all modes)
 - Vector search performance (205 RPS - competitive with lexical)
 - Index efficiency (HNSW algorithm is production-ready)
-- System stability at ~200 RPS load (92% success rate)
+- Parallel execution benefits (hybrid outperforms individual modes)
 
 **What doesn't scale:**
-- Two-query architecture (fundamental limitation)
+- System saturation at 270 RPS (5.95% failures, high latency)
+- Two-query architecture (fundamental limitation preventing >300 RPS)
 - Full-text search performance (needs optimization)
 - Resource limits (connection pool, CPU saturation)
 
@@ -1182,10 +1302,12 @@ Through systematic load testing and optimization, we successfully **solved the v
 
 ### Recommendations
 
-1. **Immediate (this week):** Test hybrid mode with HNSW to confirm ~200-210 RPS
-2. **Short-term (1-2 weeks):** Optimize text search, fix resource saturation → achieve 300 RPS
+1. **Immediate (this week):** ✅ ~~Test hybrid mode with HNSW~~ **DONE** - achieved 270 RPS
+2. **Short-term (1-2 weeks):**
+   - Fix resource saturation (connection pool, monitoring) → reduce 5.95% failures to <2%
+   - Optimize text search (ts_rank, denormalize JOIN) → achieve ~300 RPS
 3. **Decision point:** Evaluate if 300 RPS meets requirements
-   - **If yes:** Continue with optimized pgvector
+   - **If yes:** Continue with optimized pgvector (ceiling ~300 RPS)
    - **If no:** Begin Milvus migration for 500+ RPS
 
 4. **Long-term:** Monitor dataset growth (currently 135k chunks)

@@ -1,0 +1,135 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ragpass}
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag} -d ${POSTGRES_DB:-ragdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpass}@db:5432/${POSTGRES_DB:-ragdb}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      - CHUNK_SIZE=${CHUNK_SIZE:-450}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-80}
+      - DATASET_NAMES=${DATASET_NAMES:-Baby,Pet_Supplies,Video_Games}
+      - DATASET_BASE_URL=${DATASET_BASE_URL:-https://snap.stanford.edu/data/amazon/productGraph/categoryFiles}
+      - LOCAL_DATA_PATH=${LOCAL_DATA_PATH:-}
+      - MAX_REVIEWS_PER_DATASET=${MAX_REVIEWS_PER_DATASET:-5000}
+      - MAX_WORKERS=${MAX_WORKERS:-4}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+      - PYTHONPATH=/app/src
+    volumes:
+      - ${LOCAL_DATA_PATH:-/tmp/amazon_reviews}:${LOCAL_DATA_PATH:-/tmp/amazon_reviews}:ro
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "rag_retrieval.api:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring", "loadtest"]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-remote-write-receiver"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - db
+      - app
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["monitoring"]
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    profiles: ["monitoring"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /sys:/sys:ro
+      - /:/rootfs:ro
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    profiles: ["monitoring"]
+    ports:
+      - "9100:9100"
+    pid: "host"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    profiles: ["monitoring"]
+    environment:
+      - DATA_SOURCE_NAME=postgresql://${POSTGRES_USER:-rag}:${POSTGRES_PASSWORD:-ragpass}@db:5432/${POSTGRES_DB:-ragdb}?sslmode=disable
+    ports:
+      - "9187:9187"
+    depends_on:
+      - db
+
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    entrypoint: ["k6"]
+    working_dir: /scripts
+    command:
+      [
+        "run",
+        "-o",
+        "experimental-prometheus-rw=http://prometheus:9090/api/v1/write",
+        "k6-query.js",
+      ]
+    volumes:
+      - ./loadtest:/scripts
+    depends_on:
+      - app
+      - prometheus
+    environment:
+      - BASE_URL=http://app:8000
+      - K6_PROMETHEUS_RW_SERVER_URL=http://prometheus:9090/api/v1/write
+      - K6_PROMETHEUS_RW_TREND_STATS=p(90),p(95),p(99),avg,min,max
+      - K6_PROMETHEUS_RW_PUSH_INTERVAL=5s
+
+volumes:
+  db_data:
+  prometheus_data:
+  grafana_data:

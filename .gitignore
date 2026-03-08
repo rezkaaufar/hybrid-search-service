@@ -5,3 +5,10 @@ retrieval/data/
 .env.*
 !.env.example
 *.env
+
+# GCP deployment files - contain project IDs and infra details
+gcp_commands*.md
+cloudbuild.yaml
+
+# Local notes - not for version control
+loadtest_commands.md
